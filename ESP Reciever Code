@@ -7,14 +7,17 @@
 // ===================== SETTINGS =====================
 const uint8_t ESPNOW_CHANNEL = 1;     // must match the wristband
 
-bool PRINT_READABLE = false;          // false = CSV for Python (default), true = readable text
-const int PRINT_EVERY_N = 1;          // readable mode only: print every Nth packet
+bool PRINT_READABLE = true;           // true = same text as the band, false = CSV for Python
+const int PRINT_EVERY_N = 5;          // 50 Hz / 5 = 10 lines per second (same rate as the band)
 
 // ===================== PACKETS =====================
 typedef struct __attribute__((packed)) {
   uint8_t type;                       // 1=hello, 2=data, 3=bye
   float ax, ay, az, gx, gy, gz, batt;
   uint32_t t;
+  int16_t jx, jy;                     // joystick -100..+100
+  int16_t jxRaw, jyRaw;               // joystick raw 0..4095
+  float actA, actG;                   // activity 0..1
 } DataPkt;
 
 typedef struct __attribute__((packed)) {
@@ -25,6 +28,7 @@ typedef struct __attribute__((packed)) {
 QueueHandle_t rxQueue;
 uint8_t bandMac[6];
 bool bandKnown = false;
+bool bandConnected = false;
 volatile uint32_t badLenPkts = 0;
 volatile uint32_t droppedPkts = 0;
 uint32_t pktCount = 0;
@@ -63,24 +67,31 @@ void sendCmd(uint8_t cmd, float value) {
 // ===================== PRINTING =====================
 void printPacket(const DataPkt& p) {
   if (p.type == 1) {
-    Serial.println(PRINT_READABLE ? "=== Band CONNECTED ===" : "EVT,CONNECTED");
+    bandConnected = true;
+    Serial.println(PRINT_READABLE ? ">>> Band CONNECTED" : "EVT,CONNECTED");
     return;
   }
   if (p.type == 3) {
-    Serial.println(PRINT_READABLE ? "=== Band DISCONNECTED ===" : "EVT,DISCONNECTED");
+    bandConnected = false;
+    Serial.println(PRINT_READABLE ? ">>> Band DISCONNECTED" : "EVT,DISCONNECTED");
     return;
   }
 
+  bandConnected = true;   // data only arrives while the band is connected
   pktCount++;
   if (PRINT_READABLE) {
     if (pktCount % PRINT_EVERY_N != 0) return;
-    Serial.printf("[%8.2fs] Accel(g): X=%7.3f Y=%7.3f Z=%7.3f | Gyro(dps): X=%8.2f Y=%8.2f Z=%8.2f | Batt: %.2fV | #%lu\n",
-                  p.t / 1000.0f, p.ax, p.ay, p.az, p.gx, p.gy, p.gz, p.batt,
-                  (unsigned long)pktCount);
+    // Same format as the wristband's own Serial Monitor line
+    Serial.printf("A[g] %7.3f %7.3f %7.3f | G[dps] %8.2f %8.2f %8.2f | Act %.2f/%.2f | Joy X:%4d (%4d%%) Y:%4d (%4d%%) | %s\n",
+                  p.ax, p.ay, p.az, p.gx, p.gy, p.gz,
+                  p.actA, p.actG,
+                  p.jxRaw, p.jx, p.jyRaw, p.jy,
+                  bandConnected ? "CONNECTED" : "DISCONNECTED");
   } else {
-    // D,time_ms,ax,ay,az,gx,gy,gz,batt
-    Serial.printf("D,%lu,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.2f\n",
-                  (unsigned long)p.t, p.ax, p.ay, p.az, p.gx, p.gy, p.gz, p.batt);
+    // D,time_ms,ax,ay,az,gx,gy,gz,batt,jx,jy,jxRaw,jyRaw,actA,actG
+    Serial.printf("D,%lu,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.2f,%d,%d,%d,%d,%.3f,%.3f\n",
+                  (unsigned long)p.t, p.ax, p.ay, p.az, p.gx, p.gy, p.gz, p.batt,
+                  p.jx, p.jy, p.jxRaw, p.jyRaw, p.actA, p.actG);
   }
 }
 
@@ -104,6 +115,7 @@ void setup() {
   rxQueue = xQueueCreate(64, sizeof(DataPkt));
 
   Serial.println("READY");
+  Serial.println("Commands: CAL | DISC | CONN | SCALE,0.5 | FMT,HUMAN | FMT,CSV");
 }
 
 // ===================== LOOP =====================
@@ -114,7 +126,7 @@ void loop() {
     printPacket(p);
   }
 
-  // Status line every 5 s (Python logs it; ignored by the data parser)
+  // Status line every 5 s
   if (millis() - lastStatMs > 5000) {
     lastStatMs = millis();
     if (PRINT_READABLE) {
