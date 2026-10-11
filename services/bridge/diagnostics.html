@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BREATHE · Diagnostics</title><link rel="stylesheet" href="/diagnostics.css"></head>
+<body><header><div><small>BREATHE.EXE / LOCAL TEST BENCH</small><h1 id="title">Provider diagnostics</h1></div><nav><a href="/presage" target="breathe-presage">Presage window ↗</a><a href="/voice" target="breathe-voice">Voice window ↗</a></nav></header>
+<p class="intro">Test each component before entering the interview. Keys stay in the local service. Closing the camera window stops its session unless the game is actively using it.</p>
+<div id="connection" role="status">Connecting to the local bridge…</div>
+<main>
+<section id="presage"><div class="section-title"><h2>01 / Camera & pulse</h2><span id="camera-state" class="badge">Stopped</span></div>
+<p>Choose the connected USB webcam. Presage processes its camera signal; network access to Presage is required. The pulse display is a camera-derived estimate.</p>
+<label>Camera<select id="camera"><option value="">Discover cameras first</option></select></label><button id="refresh-cameras">Discover cameras</button>
+<label class="check"><input type="checkbox" id="camera-consent"> I consent to camera-based pulse measurement through Presage for this session.</label>
+<div class="actions"><button id="start-camera">Start camera</button><button class="secondary" id="stop-camera">Stop & clear readings</button><button class="secondary" id="calibrate">Start opening baseline</button></div>
+<div class="metrics"><div><small>HEART RATE</small><strong id="bpm">—</strong><span>bpm</span></div><div><small>BASELINE</small><strong id="baseline">—</strong><span>bpm</span></div><div><small>SIGNAL CONFIDENCE</small><strong id="confidence">—</strong><span>%</span></div></div>
+<canvas id="chart" width="1000" height="160" aria-label="Heart rate trend"></canvas>
+<p id="pulse-message" class="notice">No camera session.</p><p id="validation"></p><p class="fine">Baseline requires at least 15 seconds of stable readings after measurement settles. Poor light, motion, an absent face, or a disconnected camera disables the game’s biometric effect. Heart-rate change is not a measured psychological stress level.</p>
+<details><summary>Mac setup / signing</summary><p>The helper uses SmartSpectra 3.4.0. It needs an Apple Development identity and a matching provisioning profile for Keychain access. Install full Xcode, sign into Xcode → Settings → Accounts, then follow docs/INTEGRATIONS.md in the project. This panel can detect cameras even when full measurement signing is incomplete.</p></details></section>
+<section id="voice"><div class="section-title"><h2>02 / Speech & dialogue</h2><span id="voice-state" class="badge">Idle</span></div>
+<p>Audio goes to ElevenLabs for transcription. Transcript text goes to Gemini for a short in-game reply; reply text goes to ElevenLabs for speech. This app keeps no recording or transcript files. Provider retention follows your account settings.</p>
+<label class="check"><input type="checkbox" id="voice-consent"> I consent to sending my test audio and transcript to these providers.</label>
+<div class="grid"><label>Microphone<select id="microphone"><option value="">Enable microphone list</option></select></label><label>ElevenLabs voice<select id="voice-id"><option value="">Load available voices</option></select></label></div>
+<div class="actions"><button id="devices">Enable microphone list</button><button class="secondary" id="voices">Load voices</button><button class="secondary" id="save-settings">Use these in game</button></div>
+<p class="fine">Use the Mac or USB microphone. Select AirPods as macOS sound output only. If a selected input disappears, recording stops instead of switching to AirPods.</p>
+<div class="actions"><button id="record">Record test answer</button><button class="secondary" id="stop-record" disabled>Stop & transcribe</button></div>
+<label>Transcript / adversarial prompt<textarea id="transcript" maxlength="1500" rows="4" placeholder="Try an answer, a request to repeat, or a prompt-injection attempt."></textarea></label>
+<div class="grid"><label>Current question<select id="act"><option>Name</option><option>Unreadable</option><option>Challenge</option><option>Team</option><option>Gap</option><option>GapChoice</option><option>Offer</option></select></label><label>Candidate<select id="candidate"><option value="0">Mara Voss</option><option value="1">Eli Park</option><option value="2">Noor Patel</option><option value="3">Jonah Reed</option></select></label></div>
+<div class="actions"><button id="dialogue">Test Gemini reply</button><button class="secondary" id="injection">Fill hostile test prompt</button></div>
+<pre id="reply">No reply yet.</pre>
+<label>Speech output text<input id="tts-text" maxlength="350" value="Good afternoon. Are you ready to begin?"></label><button id="tts">Test ElevenLabs speech</button><audio id="playback" controls></audio>
+<div id="provider-status" class="notice">Providers have not been tested.</div></section>
+</main><footer>Presage, speech recognition, dialogue, and playback report their own errors. The game can always be paused with Escape.</footer><script src="/diagnostics.js"></script></body></html>

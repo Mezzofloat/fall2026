@@ -7,6 +7,8 @@
   Motor LEDs: GPIO3 (green = forward), GPIO4 (red = backward), PWM
   Motor driver: GPIO6 = IN1 (forward PWM), GPIO7 = IN2 (backward PWM)
   Joystick: VRx = GPIO0, VRy = GPIO1 (VCC to 3V3, not 5V)
+  Joystick click: SW = GPIO5 to GND (internal pull-up). Left glove click = E (interact), right glove click = V (hold to talk).
+  HAND_ID: build one sketch with 0 for the LEFT glove and another with 1 for the RIGHT glove.
 
   Arduino IDE: Board = ESP32C3 Dev Module, Tools > USB CDC On Boot > ENABLED
 
@@ -48,6 +50,12 @@ const bool AUTO_CONNECT_ON_BOOT = true;
 #define PIN_DRV_IN2 7    // motor driver backward PWM
 #define PIN_JOY_X   0    // VRx (ADC1)
 #define PIN_JOY_Y   1    // VRy (ADC1)
+#define PIN_JOY_SW  5    // joystick push-button (to GND)
+
+// Which glove is this? 0 = LEFT (moves, click = E), 1 = RIGHT (looks, click = V)
+#ifndef HAND_ID            // scripts/flash-gloves.sh passes -DHAND_ID=0 for the left glove
+#define HAND_ID 1
+#endif
 
 // Set to true if the LED is wired to 3.3V instead of GND (active low)
 #define LED_ACTIVE_LOW false
@@ -83,6 +91,8 @@ typedef struct __attribute__((packed)) {
   int16_t jx, jy;                     // joystick -100..+100
   int16_t jxRaw, jyRaw;               // joystick raw 0..4095
   float actA, actG;                   // accel / gyro activity 0..1
+  uint8_t hand;                       // 0 = left glove, 1 = right glove
+  uint8_t btn;                        // joystick click: 1 = pressed
 } DataPkt;
 
 typedef struct __attribute__((packed)) {
@@ -125,6 +135,8 @@ bool btnLongHandled = false;
 int joyXRaw = 0, joyYRaw = 0;          // 0..4095
 int joyXCenter = 2048, joyYCenter = 2048;
 int joyXPct = 0, joyYPct = 0;          // -100..+100
+bool joyClick = false;                 // debounced joystick push-button
+uint8_t joyClickRaw = 0; uint32_t joyClickChangeMs = 0;
 const int JOY_DEADZONE_PCT = 5;
 uint32_t lastJoyMs = 0;
 
@@ -230,6 +242,11 @@ void readJoystick() {
   joyYRaw = sy / 4;
   joyXPct = joyToPct(joyXRaw, joyXCenter);
   joyYPct = joyToPct(joyYRaw, joyYCenter);
+  // push-button: pressed = LOW, 30 ms debounce
+  uint8_t raw = digitalRead(PIN_JOY_SW) == LOW ? 1 : 0;
+  uint32_t nowMs = millis();
+  if (raw != joyClickRaw) { joyClickRaw = raw; joyClickChangeMs = nowMs; }
+  else if (nowMs - joyClickChangeMs >= 30) joyClick = raw;
 }
 
 // ===================== MPU6500 =====================
@@ -410,6 +427,8 @@ void sendData() {
   p.jxRaw = joyXRaw;   p.jyRaw = joyYRaw;
   p.actA = accelActivity;
   p.actG = gyroActivity;
+  p.hand = HAND_ID;
+  p.btn = joyClick ? 1 : 0;
 
   sAx = sAy = sAz = sGx = sGy = sGz = 0;
   sCount = 0;
@@ -465,6 +484,7 @@ void handleButton() {
 // ===================== SETUP =====================
 void setup() {
   Serial.begin(115200);
+  Serial.setTxTimeoutMs(0);          // never stall when no computer is reading (battery / power-only use)
   uint32_t t0 = millis();
   while (!Serial && millis() - t0 < 1500) delay(10);   // wait briefly for USB CDC
   Serial.println("\n=== ESP32-C3 Wristband ===");
@@ -474,6 +494,7 @@ void setup() {
 
   pinMode(PIN_B, OUTPUT);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_JOY_SW, INPUT_PULLUP);
   setBlue(false);
 
   analogReadResolution(12);
@@ -560,10 +581,11 @@ void loop() {
 
   if (ms - lastPrintMs >= PRINT_PERIOD_MS) {
     lastPrintMs = ms;
-    Serial.printf("A[g] %7.3f %7.3f %7.3f | G[dps] %8.2f %8.2f %8.2f | Act %.2f/%.2f | Joy X:%4d (%4d%%) Y:%4d (%4d%%) | %s\n",
+    if (Serial)                    // only print when a computer is actually listening
+    Serial.printf("A[g] %7.3f %7.3f %7.3f | G[dps] %8.2f %8.2f %8.2f | Act %.2f/%.2f | Joy X:%4d (%4d%%) Y:%4d (%4d%%) Click:%d | %s\n",
                   ax, ay, az, gx, gy, gz,
                   accelActivity, gyroActivity,
-                  joyXRaw, joyXPct, joyYRaw, joyYPct,
+                  joyXRaw, joyXPct, joyYRaw, joyYPct, joyClick ? 1 : 0,
                   connectedToServer ? "CONNECTED" : "DISCONNECTED");
   }
 

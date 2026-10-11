@@ -7,7 +7,7 @@
 // ===================== SETTINGS =====================
 const uint8_t ESPNOW_CHANNEL = 1;     // must match the wristband
 
-bool PRINT_READABLE = true;           // true = same text as the band, false = CSV for Python
+bool PRINT_READABLE = false;          // false = CSV for the hub/game (default), true = readable text
 const int PRINT_EVERY_N = 5;          // 50 Hz / 5 = 10 lines per second (same rate as the band)
 
 // ===================== PACKETS =====================
@@ -18,6 +18,8 @@ typedef struct __attribute__((packed)) {
   int16_t jx, jy;                     // joystick -100..+100
   int16_t jxRaw, jyRaw;               // joystick raw 0..4095
   float actA, actG;                   // activity 0..1
+  uint8_t hand;                       // 0 = left glove, 1 = right glove
+  uint8_t btn;                        // joystick click: 1 = pressed
 } DataPkt;
 
 typedef struct __attribute__((packed)) {
@@ -26,8 +28,8 @@ typedef struct __attribute__((packed)) {
 } CmdPkt;
 
 QueueHandle_t rxQueue;
-uint8_t bandMac[6];
-bool bandKnown = false;
+uint8_t bandMac[2][6];                // one slot per glove (0 = left, 1 = right)
+bool bandKnown[2] = {false, false};
 bool bandConnected = false;
 volatile uint32_t badLenPkts = 0;
 volatile uint32_t droppedPkts = 0;
@@ -37,16 +39,17 @@ uint32_t lastStatMs = 0;
 // ===================== ESP-NOW =====================
 void handleRecv(const uint8_t* mac, const uint8_t* d, int len) {
   if (len != sizeof(DataPkt)) { badLenPkts++; return; }
-  if (!bandKnown) {
-    memcpy(bandMac, mac, 6);
+  DataPkt pkt;
+  memcpy(&pkt, d, sizeof(pkt));
+  uint8_t h = pkt.hand > 1 ? 1 : pkt.hand;
+  if (!bandKnown[h]) {
+    memcpy(bandMac[h], mac, 6);
     esp_now_peer_info_t p = {};
     memcpy(p.peer_addr, mac, 6);
     p.channel = ESPNOW_CHANNEL;
     p.encrypt = false;
-    if (esp_now_add_peer(&p) == ESP_OK) bandKnown = true;
+    if (esp_now_add_peer(&p) == ESP_OK) bandKnown[h] = true;
   }
-  DataPkt pkt;
-  memcpy(&pkt, d, sizeof(pkt));
   if (xQueueSend(rxQueue, &pkt, 0) != pdTRUE) droppedPkts++;
 }
 
@@ -57,9 +60,9 @@ void onRecv(const uint8_t* mac, const uint8_t* d, int len) { handleRecv(mac, d, 
 #endif
 
 void sendCmd(uint8_t cmd, float value) {
-  if (!bandKnown) { Serial.println("ERR,band not seen yet"); return; }
+  if (!bandKnown[0] && !bandKnown[1]) { Serial.println("ERR,band not seen yet"); return; }
   CmdPkt c = { cmd, value };
-  esp_now_send(bandMac, (uint8_t*)&c, sizeof(c));
+  for (int h = 0; h < 2; h++) if (bandKnown[h]) esp_now_send(bandMac[h], (uint8_t*)&c, sizeof(c));
   if (PRINT_READABLE) Serial.printf(">> Command %u sent to band (value %.2f)\n", cmd, value);
   else                Serial.printf("ACK,%u,%.2f\n", cmd, value);
 }
@@ -82,16 +85,16 @@ void printPacket(const DataPkt& p) {
   if (PRINT_READABLE) {
     if (pktCount % PRINT_EVERY_N != 0) return;
     // Same format as the wristband's own Serial Monitor line
-    Serial.printf("A[g] %7.3f %7.3f %7.3f | G[dps] %8.2f %8.2f %8.2f | Act %.2f/%.2f | Joy X:%4d (%4d%%) Y:%4d (%4d%%) | %s\n",
+    Serial.printf("A[g] %7.3f %7.3f %7.3f | G[dps] %8.2f %8.2f %8.2f | Act %.2f/%.2f | Joy X:%4d (%4d%%) Y:%4d (%4d%%) Click:%d | %s %s\n",
                   p.ax, p.ay, p.az, p.gx, p.gy, p.gz,
                   p.actA, p.actG,
-                  p.jxRaw, p.jx, p.jyRaw, p.jy,
-                  bandConnected ? "CONNECTED" : "DISCONNECTED");
+                  p.jxRaw, p.jx, p.jyRaw, p.jy, p.btn ? 1 : 0,
+                  p.hand ? "R" : "L", bandConnected ? "CONNECTED" : "DISCONNECTED");
   } else {
-    // D,time_ms,ax,ay,az,gx,gy,gz,batt,jx,jy,jxRaw,jyRaw,actA,actG
-    Serial.printf("D,%lu,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.2f,%d,%d,%d,%d,%.3f,%.3f\n",
+    // D,time_ms,ax,ay,az,gx,gy,gz,batt,jx,jy,jxRaw,jyRaw,actA,actG,hand(0=L,1=R),btn(0/1)
+    Serial.printf("D,%lu,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.2f,%d,%d,%d,%d,%.3f,%.3f,%u,%u\n",
                   (unsigned long)p.t, p.ax, p.ay, p.az, p.gx, p.gy, p.gz, p.batt,
-                  p.jx, p.jy, p.jxRaw, p.jyRaw, p.actA, p.actG);
+                  p.jx, p.jy, p.jxRaw, p.jyRaw, p.actA, p.actG, (unsigned)p.hand, (unsigned)p.btn);
   }
 }
 

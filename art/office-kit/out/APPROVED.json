@@ -1,0 +1,19 @@
+{
+  "blend": "/home/anon/fall2026/art/office-kit/out/model.blend",
+  "blend_sha256": "8bcdfc4c1e9a0dc3d756cee1447f9161ec6119d3604ab2c3494143fc45ff18d8",
+  "reviewer": "advisor",
+  "review_dir": "/home/anon/fall2026/art/office-kit/out/review/20261011-005741",
+  "approved_at": "2026-10-11 01:05:38",
+  "requirements": [
+    "R1",
+    "R2",
+    "R3",
+    "R4",
+    "R5",
+    "R6",
+    "R7",
+    "R8",
+    "R9",
+    "R10"
+  ]
+}

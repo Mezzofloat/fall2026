@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+art/*/out/review/
+art/*/out/renders/
+art/*/out/grip/
+.env

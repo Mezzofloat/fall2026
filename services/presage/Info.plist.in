@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.breatheexe.presage</string>
+<key>CFBundleName</key><string>BreathePresage</string>
+<key>CFBundleExecutable</key><string>breathe_presage</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleVersion</key><string>1</string>
+<key>LSUIElement</key><true/>
+<key>NSCameraUsageDescription</key><string>BREATHE uses the selected webcam with Presage to estimate pulse for gameplay after consent.</string>
+</dict></plist>

@@ -1,0 +1,6 @@
+{
+  "name": "Breathe.EditMode",
+  "references": ["Breathe.Runtime"],
+  "includePlatforms": ["Editor"],
+  "optionalUnityReferences": ["TestAssemblies"]
+}

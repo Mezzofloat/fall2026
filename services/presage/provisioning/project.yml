@@ -1,0 +1,19 @@
+name: PresageProvisioning
+options:
+  bundleIdPrefix: com.breatheexe
+targets:
+  PresageProvisioning:
+    type: application
+    platform: macOS
+    deploymentTarget: "12.0"
+    sources: [Stub]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.breatheexe.presage
+        DEVELOPMENT_TEAM: 8Q9QFQAKA7
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "Apple Development"
+        CODE_SIGN_ENTITLEMENTS: Stub/Stub.entitlements
+        ENABLE_HARDENED_RUNTIME: NO
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSCameraUsageDescription: "Stub used only to obtain a provisioning profile."
