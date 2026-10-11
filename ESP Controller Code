@@ -1,0 +1,525 @@
+/*
+  ESP32 Wristband: MPU6500 -> ESP-NOW -> USB receiver ESP32 -> Python/Flask
+  -------------------------------------------------------------------------
+  MPU6500 : SDA = GPIO22, SCL = GPIO23 (I2C addr 0x68)
+  RGB LED : Blue = GPIO27 used (Red = GPIO25, Green = GPIO26 unused), common cathode
+  Button  : GPIO18 to GND (internal pull-up)
+  Motor LEDs: GPIO19 (green = forward), GPIO21 (red = backward), PWM
+
+  Button:
+    Short press = connect / disconnect
+    Hold 3 sec  = re-calibrate sensor (keep band still and flat)
+
+  LED:
+    Flashing blue   = disconnected
+    Solid blue      = connected
+    Fast blue flash = calibrating / MPU error
+    (Battery check is DISABLED for now)
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <esp_idf_version.h>
+
+// ===================== USER SETTINGS =====================
+// >>> PASTE THE MAC PRINTED BY THE RECEIVER (RECEIVER_MAC,xx:xx:xx:xx:xx:xx) <<<
+uint8_t RECEIVER_MAC[6] = {0xA0, 0xB7, 0x65, 0x0F, 0x4D, 0x1C};
+const uint8_t ESPNOW_CHANNEL = 1;          // must match the receiver
+
+const bool AUTO_CONNECT_ON_BOOT = true;
+
+// ===================== PINS =====================
+#define PIN_SDA     22
+#define PIN_SCL     23
+#define PIN_R       25
+#define PIN_G       26
+#define PIN_B       27
+#define PIN_BUTTON  18
+#define PIN_MOTOR1  19   // green LED = forward
+#define PIN_MOTOR2  21   // red LED   = backward
+// #define PIN_BATT 34   // battery sensing disabled for now
+
+// Set to true if your RGB LED is common ANODE
+#define LED_COMMON_ANODE false
+
+// ===================== BATTERY (DISABLED) =====================
+// const float BATT_DIVIDER   = 2.0;
+// const float BATT_LOW_V     = 3.30;
+// const float BATT_RECOVER_V = 3.45;
+
+// ===================== MPU6500 =====================
+#define MPU_ADDR        0x68
+#define REG_SMPLRT_DIV  0x19
+#define REG_CONFIG      0x1A
+#define REG_GYRO_CFG    0x1B
+#define REG_ACCEL_CFG   0x1C
+#define REG_ACCEL_CFG2  0x1D
+#define REG_ACCEL_XOUT  0x3B
+#define REG_PWR_MGMT_1  0x6B
+#define REG_WHO_AM_I    0x75
+
+// +-4 g and +-500 dps
+const float ACCEL_LSB_PER_G  = 8192.0;
+const float GYRO_LSB_PER_DPS = 65.5;
+
+const uint32_t SAMPLE_PERIOD_US = 5000;   // 200 Hz sampling
+const uint32_t SEND_PERIOD_MS   = 20;     // 50 Hz to receiver
+const uint32_t PRINT_PERIOD_MS  = 100;    // 10 Hz serial print
+
+// ===================== PWM =====================
+const int PWM_FREQ = 5000;
+const int PWM_RES  = 8;   // 0-255
+
+// ===================== PACKETS =====================
+typedef struct __attribute__((packed)) {
+  uint8_t type;                       // 1=hello, 2=data, 3=bye
+  float ax, ay, az, gx, gy, gz, batt;
+  uint32_t t;
+} DataPkt;
+
+typedef struct __attribute__((packed)) {
+  uint8_t cmd;                        // 1=calibrate, 2=disconnect, 3=motor scale, 4=connect
+  float value;
+} CmdPkt;
+
+// ===================== STATE =====================
+float axOff = 0, ayOff = 0, azOff = 0;
+float gxOff = 0, gyOff = 0, gzOff = 0;
+
+float ax, ay, az, gx, gy, gz;            // calibrated values (g, dps)
+
+double sAx = 0, sAy = 0, sAz = 0, sGx = 0, sGy = 0, sGz = 0;
+int sCount = 0;
+
+float accelActivity = 0, gyroActivity = 0;   // smoothed 0..1
+
+bool connectedToServer = false;
+float battVoltage = 0;         // sent as 0.00 while battery check is disabled
+float motorScale = 1.0;
+
+int      motorDir = 1;         // 1 = forward (green), -1 = backward (red)
+uint32_t nextDirChangeMs = 0;
+float    motorLevel = 0;       // smoothed 0..255
+
+volatile int     failCount = 0;
+volatile bool    sendDone = false, sendOk = false;
+volatile uint8_t pendingCmd = 0;
+volatile float   pendingValue = 0;
+
+uint32_t lastSampleUs = 0, lastSendMs = 0, lastPrintMs = 0;
+
+// button
+bool btnLast = HIGH;
+uint32_t btnDownMs = 0;
+bool btnLongHandled = false;
+
+// ===================== PWM HELPERS =====================
+void pwmSetup(int pin) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(pin, PWM_FREQ, PWM_RES);
+#else
+  static int ch = 0;
+  ledcSetup(ch, PWM_FREQ, PWM_RES);
+  ledcAttachPin(pin, ch);
+  ch++;
+#endif
+}
+
+// core 2.x channel mapping: first pwmSetup = ch0 (motor1), second = ch1 (motor2)
+void pwmWrite(int pin, int ch, int duty) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(pin, duty);
+#else
+  ledcWrite(ch, duty);
+#endif
+}
+
+void setMotors(int d1, int d2) {
+  pwmWrite(PIN_MOTOR1, 0, d1);
+  pwmWrite(PIN_MOTOR2, 1, d2);
+}
+
+void updateMotors() {
+  if (!connectedToServer) {
+    motorLevel = 0;
+    setMotors(0, 0);
+    return;
+  }
+
+  float activity = max(accelActivity, gyroActivity);   // 0..1
+  uint32_t ms = millis();
+
+  // Randomly flip direction; the more you move, the faster it flips
+  if (ms >= nextDirChangeMs) {
+    motorDir = (random(0, 2) == 0) ? 1 : -1;
+    long minT = 400 - (long)(activity * 320);          // 400 ms (calm) -> 80 ms (hard motion)
+    nextDirChangeMs = ms + random(minT, minT * 3);
+  }
+
+  // Smooth ramp toward the target brightness
+  float target = activity * 255.0f * motorScale;
+  motorLevel += 0.25f * (target - motorLevel);
+  int duty = constrain((int)motorLevel, 0, 255);
+
+  if (motorDir > 0) setMotors(duty, 0);    // green LED (GPIO19) = forward
+  else              setMotors(0, duty);    // red LED   (GPIO21) = backward
+}
+
+// ===================== LED =====================
+void setRGB(bool r, bool g, bool b) {
+  if (LED_COMMON_ANODE) { r = !r; g = !g; b = !b; }
+  digitalWrite(PIN_R, r);
+  digitalWrite(PIN_G, g);
+  digitalWrite(PIN_B, b);
+}
+
+void updateLED() {
+  if (connectedToServer) {
+    setRGB(false, false, true);               // solid blue
+  } else {
+    bool on = (millis() / 500) % 2;           // flashing blue
+    setRGB(false, false, on);
+  }
+}
+
+// ===================== MPU6500 =====================
+void mpuWrite(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+uint8_t mpuRead8(uint8_t reg) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)1);
+  return Wire.available() ? Wire.read() : 0xFF;
+}
+
+bool mpuBegin() {
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(400000);
+
+  uint8_t id = mpuRead8(REG_WHO_AM_I);
+  Serial.printf("WHO_AM_I = 0x%02X (MPU6500 expects 0x70)\n", id);
+  if (id != 0x70 && id != 0x71 && id != 0x73) {
+    Serial.println("WARNING: unexpected WHO_AM_I, continuing anyway if device responds.");
+    if (id == 0xFF) return false;
+  }
+
+  mpuWrite(REG_PWR_MGMT_1, 0x80);   // reset
+  delay(100);
+  mpuWrite(REG_PWR_MGMT_1, 0x01);   // wake, PLL with gyro X clock
+  delay(50);
+  mpuWrite(REG_SMPLRT_DIV, 0x00);   // 1 kHz internal
+  mpuWrite(REG_CONFIG, 0x03);       // gyro DLPF ~41 Hz
+  mpuWrite(REG_GYRO_CFG, 0x08);     // +-500 dps
+  mpuWrite(REG_ACCEL_CFG, 0x08);    // +-4 g
+  mpuWrite(REG_ACCEL_CFG2, 0x03);   // accel DLPF ~44 Hz
+  delay(50);
+  return true;
+}
+
+bool mpuReadRaw(int16_t* r) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(REG_ACCEL_XOUT);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)14) != 14) return false;
+  for (int i = 0; i < 7; i++) {
+    uint8_t h = Wire.read();
+    uint8_t l = Wire.read();
+    r[i] = (int16_t)((h << 8) | l);
+  }
+  // r: 0-2 accel, 3 temp, 4-6 gyro
+  return true;
+}
+
+void calibrateMPU() {
+  Serial.println("Calibrating... keep the band STILL and FLAT (Z up).");
+  setRGB(false, false, false);
+  setMotors(0, 0);
+  delay(1000);
+
+  const int N = 1500;
+  double sax = 0, say = 0, saz = 0, sgx = 0, sgy = 0, sgz = 0;
+  int16_t r[7];
+  int good = 0;
+
+  for (int i = 0; i < N; i++) {
+    if (i % 50 == 0) setRGB(false, false, (i / 50) % 2);   // fast blue flash while calibrating
+    if (mpuReadRaw(r)) {
+      sax += r[0]; say += r[1]; saz += r[2];
+      sgx += r[4]; sgy += r[5]; sgz += r[6];
+      good++;
+    }
+    delay(3);
+  }
+  if (good < 100) {
+    Serial.println("Calibration failed: not enough samples.");
+    return;
+  }
+  axOff = (sax / good) / ACCEL_LSB_PER_G;
+  ayOff = (say / good) / ACCEL_LSB_PER_G;
+  azOff = (saz / good) / ACCEL_LSB_PER_G - 1.0;     // remove 1 g gravity on Z
+  gxOff = (sgx / good) / GYRO_LSB_PER_DPS;
+  gyOff = (sgy / good) / GYRO_LSB_PER_DPS;
+  gzOff = (sgz / good) / GYRO_LSB_PER_DPS;
+
+  // clear any averaging accumulated before calibration
+  sAx = sAy = sAz = sGx = sGy = sGz = 0;
+  sCount = 0;
+
+  Serial.println("Calibration done.");
+  Serial.printf("Accel offsets (g):   %.4f %.4f %.4f\n", axOff, ayOff, azOff);
+  Serial.printf("Gyro offsets (dps):  %.4f %.4f %.4f\n", gxOff, gyOff, gzOff);
+}
+
+// ===================== BATTERY (DISABLED) =====================
+/*
+bool lowBattery = false;
+
+void updateBattery() {
+  uint32_t mv = 0;
+  for (int i = 0; i < 16; i++) mv += analogReadMilliVolts(PIN_BATT);
+  battVoltage = (mv / 16.0) / 1000.0 * BATT_DIVIDER;
+
+  if (battVoltage < 1.0) { lowBattery = false; return; }
+
+  if (!lowBattery && battVoltage < BATT_LOW_V) lowBattery = true;
+  else if (lowBattery && battVoltage > BATT_RECOVER_V) lowBattery = false;
+}
+*/
+
+// ===================== ESP-NOW =====================
+void handleSent(bool ok) {
+  sendOk = ok;
+  sendDone = true;
+  if (ok) failCount = 0; else failCount = failCount + 1;
+}
+
+void handleRecv(const uint8_t* d, int len) {
+  if (len != (int)sizeof(CmdPkt)) return;
+  CmdPkt c;
+  memcpy(&c, d, sizeof(c));
+  pendingValue = c.value;
+  pendingCmd = c.cmd;                 // handled in loop(), not in the callback
+}
+
+// Send callback signature changed in newer IDF versions
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+void onSent(const wifi_tx_info_t*, esp_now_send_status_t s) { handleSent(s == ESP_NOW_SEND_SUCCESS); }
+#else
+void onSent(const uint8_t*, esp_now_send_status_t s) { handleSent(s == ESP_NOW_SEND_SUCCESS); }
+#endif
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+void onRecv(const esp_now_recv_info_t*, const uint8_t* d, int len) { handleRecv(d, len); }
+#else
+void onRecv(const uint8_t*, const uint8_t* d, int len) { handleRecv(d, len); }
+#endif
+
+bool espNowBegin() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  if (esp_now_init() != ESP_OK) return false;
+  esp_now_register_send_cb(onSent);
+  esp_now_register_recv_cb(onRecv);
+
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, RECEIVER_MAC, 6);
+  peer.channel = ESPNOW_CHANNEL;
+  peer.encrypt = false;
+  return esp_now_add_peer(&peer) == ESP_OK;
+}
+
+bool sendAndWait(const DataPkt& p) {
+  sendDone = false;
+  if (esp_now_send(RECEIVER_MAC, (const uint8_t*)&p, sizeof(p)) != ESP_OK) return false;
+  uint32_t t = millis();
+  while (!sendDone && millis() - t < 150) delay(1);
+  return sendDone && sendOk;
+}
+
+void connectToServer() {
+  DataPkt p = {};
+  p.type = 1;
+  connectedToServer = sendAndWait(p);
+  failCount = 0;
+  Serial.println(connectedToServer ? ">>> Connected to receiver" : ">>> Receiver not reachable");
+}
+
+void disconnectFromServer() {
+  if (connectedToServer) {
+    DataPkt p = {};
+    p.type = 3;
+    sendAndWait(p);
+  }
+  connectedToServer = false;
+  setMotors(0, 0);
+  Serial.println(">>> Disconnected");
+}
+
+void sendData() {
+  if (!connectedToServer || sCount == 0) return;
+
+  DataPkt p = {};
+  p.type = 2;
+  p.ax = sAx / sCount; p.ay = sAy / sCount; p.az = sAz / sCount;
+  p.gx = sGx / sCount; p.gy = sGy / sCount; p.gz = sGz / sCount;
+  p.batt = battVoltage;
+  p.t = millis();
+
+  sAx = sAy = sAz = sGx = sGy = sGz = 0;
+  sCount = 0;
+
+  esp_now_send(RECEIVER_MAC, (const uint8_t*)&p, sizeof(p));
+
+  if (failCount >= 10) {
+    Serial.println("Lost connection to receiver.");
+    connectedToServer = false;
+    setMotors(0, 0);
+  }
+}
+
+void handlePendingCommand() {
+  uint8_t c = pendingCmd;
+  if (!c) return;
+  pendingCmd = 0;
+  if (c == 1) calibrateMPU();
+  else if (c == 2) disconnectFromServer();
+  else if (c == 3) motorScale = constrain((float)pendingValue, 0.0f, 1.0f);
+  else if (c == 4) connectToServer();
+}
+
+// ===================== BUTTON =====================
+void handleButton() {
+  bool now = digitalRead(PIN_BUTTON);
+  uint32_t ms = millis();
+
+  if (btnLast == HIGH && now == LOW) {          // pressed
+    delay(20);                                  // debounce
+    if (digitalRead(PIN_BUTTON) == LOW) {
+      btnDownMs = ms;
+      btnLongHandled = false;
+      btnLast = LOW;
+    }
+  } else if (btnLast == LOW && now == LOW) {    // held
+    if (!btnLongHandled && ms - btnDownMs >= 3000) {
+      btnLongHandled = true;
+      calibrateMPU();
+    }
+  } else if (btnLast == LOW && now == HIGH) {   // released
+    delay(20);
+    if (digitalRead(PIN_BUTTON) == HIGH) {
+      if (!btnLongHandled) {                    // short press
+        if (connectedToServer) disconnectFromServer();
+        else connectToServer();
+      }
+      btnLast = HIGH;
+    }
+  }
+}
+
+// ===================== SETUP =====================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== ESP32 Wristband ===");
+
+  pinMode(PIN_R, OUTPUT);
+  pinMode(PIN_G, OUTPUT);
+  pinMode(PIN_B, OUTPUT);
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  setRGB(false, false, false);
+
+  pwmSetup(PIN_MOTOR1);
+  pwmSetup(PIN_MOTOR2);
+  setMotors(0, 0);
+
+  randomSeed(esp_random());
+
+  // Battery ADC setup disabled
+  // analogReadResolution(12);
+  // analogSetPinAttenuation(PIN_BATT, ADC_11db);
+
+  if (!mpuBegin()) {
+    Serial.println("MPU6500 not found! Check wiring (SDA=22, SCL=23).");
+    while (true) {                    // rapid blue flashing forever
+      setRGB(false, false, true);  delay(100);
+      setRGB(false, false, false); delay(100);
+    }
+  }
+
+  calibrateMPU();
+  // updateBattery();   // disabled
+
+  if (!espNowBegin()) Serial.println("ESP-NOW init failed");
+  if (AUTO_CONNECT_ON_BOOT) connectToServer();
+
+  lastSampleUs = micros();
+}
+
+// ===================== LOOP =====================
+void loop() {
+  handlePendingCommand();
+  handleButton();
+
+  uint32_t nowUs = micros();
+  if (nowUs - lastSampleUs >= SAMPLE_PERIOD_US) {
+    lastSampleUs += SAMPLE_PERIOD_US;
+    if (nowUs - lastSampleUs > 50000) lastSampleUs = nowUs;   // resync after long stall
+
+    int16_t r[7];
+    if (mpuReadRaw(r)) {
+      ax = r[0] / ACCEL_LSB_PER_G - axOff;
+      ay = r[1] / ACCEL_LSB_PER_G - ayOff;
+      az = r[2] / ACCEL_LSB_PER_G - azOff;
+      gx = r[4] / GYRO_LSB_PER_DPS - gxOff;
+      gy = r[5] / GYRO_LSB_PER_DPS - gyOff;
+      gz = r[6] / GYRO_LSB_PER_DPS - gzOff;
+
+      sAx += ax; sAy += ay; sAz += az;
+      sGx += gx; sGy += gy; sGz += gz;
+      sCount++;
+
+      // ---- movement activity (0..1) ----
+      float aMag = sqrtf(ax * ax + ay * ay + az * az);
+      float aDyn = fabsf(aMag - 1.0f);                         // g beyond gravity
+      float gMag = sqrtf(gx * gx + gy * gy + gz * gz);         // dps
+
+      float aNorm = constrain((aDyn - 0.03f) / 1.0f, 0.0f, 1.0f);    // deadband 0.03 g, full at ~1 g
+      float gNorm = constrain((gMag - 5.0f) / 250.0f, 0.0f, 1.0f);   // deadband 5 dps, full at ~250 dps
+
+      // fast attack, slow decay
+      accelActivity += (aNorm > accelActivity ? 0.20f : 0.01f) * (aNorm - accelActivity);
+      gyroActivity  += (gNorm > gyroActivity  ? 0.20f : 0.01f) * (gNorm - gyroActivity);
+
+      updateMotors();
+    }
+  }
+
+  uint32_t ms = millis();
+
+  if (ms - lastSendMs >= SEND_PERIOD_MS) {
+    lastSendMs = ms;
+    sendData();
+  }
+
+  // if (ms - lastBattMs >= 2000) { lastBattMs = ms; updateBattery(); }   // disabled
+
+  if (ms - lastPrintMs >= PRINT_PERIOD_MS) {
+    lastPrintMs = ms;
+    Serial.printf("A[g] %7.3f %7.3f %7.3f | G[dps] %8.2f %8.2f %8.2f | Act %.2f/%.2f | Batt: disabled | %s\n",
+                  ax, ay, az, gx, gy, gz,
+                  accelActivity, gyroActivity,
+                  connectedToServer ? "CONNECTED" : "DISCONNECTED");
+  }
+
+  updateLED();
+}
