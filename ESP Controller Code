@@ -5,6 +5,7 @@
   Blue LED: GPIO10 (through a resistor to GND)
   Button  : GPIO2 to GND (internal pull-up)
   Motor LEDs: GPIO3 (green = forward), GPIO4 (red = backward), PWM
+  Motor driver: GPIO6 = IN1 (forward PWM), GPIO7 = IN2 (backward PWM)
   Joystick: VRx = GPIO0, VRy = GPIO1 (VCC to 3V3, not 5V)
 
   Arduino IDE: Board = ESP32C3 Dev Module, Tools > USB CDC On Boot > ENABLED
@@ -17,6 +18,9 @@
     Flashing   = not connected to receiver
     Solid      = connected
     Fast flash = calibrating / MPU error
+
+  Motor: sweeps smoothly forward -> backward -> forward while connected.
+         Strength and speed increase with movement.
 */
 
 #include <Arduino.h>
@@ -40,6 +44,8 @@ const bool AUTO_CONNECT_ON_BOOT = true;
 #define PIN_BUTTON  2
 #define PIN_MOTOR1  3    // green LED = forward
 #define PIN_MOTOR2  4    // red LED   = backward
+#define PIN_DRV_IN1 6    // motor driver forward PWM
+#define PIN_DRV_IN2 7    // motor driver backward PWM
 #define PIN_JOY_X   0    // VRx (ADC1)
 #define PIN_JOY_Y   1    // VRy (ADC1)
 
@@ -66,8 +72,8 @@ const uint32_t SEND_PERIOD_MS   = 20;     // 50 Hz to receiver
 const uint32_t PRINT_PERIOD_MS  = 100;    // 10 Hz serial print
 
 // ===================== PWM =====================
-const int PWM_FREQ = 5000;
-const int PWM_RES  = 8;   // 0-255
+const int PWM_FREQ = 5000;   // use 20000 if the motor whines
+const int PWM_RES  = 8;      // 0-255
 
 // ===================== PACKETS =====================
 typedef struct __attribute__((packed)) {
@@ -99,9 +105,9 @@ bool connectedToServer = false;
 float battVoltage = 0;         // sent as 0.00 (battery check removed)
 float motorScale = 1.0;
 
-int      motorDir = 1;         // 1 = forward (green), -1 = backward (red)
-uint32_t nextDirChangeMs = 0;
 float    motorLevel = 0;       // smoothed 0..255
+float    motorPhase = 0;       // 0..2*PI position in the forward/backward cycle
+uint32_t lastMotorMs = 0;
 
 volatile int     failCount = 0;
 volatile bool    sendDone = false, sendOk = false;
@@ -123,6 +129,8 @@ const int JOY_DEADZONE_PCT = 5;
 uint32_t lastJoyMs = 0;
 
 // ===================== PWM HELPERS =====================
+// Core 2.x: channels are assigned in call order (0,1,2,3).
+// pwmSetup order in setup(): MOTOR1, MOTOR2, DRV_IN1, DRV_IN2
 void pwmSetup(int pin) {
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
   ledcAttach(pin, PWM_FREQ, PWM_RES);
@@ -134,7 +142,6 @@ void pwmSetup(int pin) {
 #endif
 }
 
-// core 2.x channel mapping: first pwmSetup = ch0 (motor1), second = ch1 (motor2)
 void pwmWrite(int pin, int ch, int duty) {
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
   ledcWrite(pin, duty);
@@ -144,8 +151,10 @@ void pwmWrite(int pin, int ch, int duty) {
 }
 
 void setMotors(int d1, int d2) {
-  pwmWrite(PIN_MOTOR1, 0, d1);
-  pwmWrite(PIN_MOTOR2, 1, d2);
+  pwmWrite(PIN_MOTOR1, 0, d1);     // green LED  = forward
+  pwmWrite(PIN_MOTOR2, 1, d2);     // red LED    = backward
+  pwmWrite(PIN_DRV_IN1, 2, d1);    // motor driver IN1
+  pwmWrite(PIN_DRV_IN2, 3, d2);    // motor driver IN2
 }
 
 void updateMotors() {
@@ -157,21 +166,24 @@ void updateMotors() {
 
   float activity = max(accelActivity, gyroActivity);   // 0..1
   uint32_t ms = millis();
+  float dt = (ms - lastMotorMs) / 1000.0f;
+  lastMotorMs = ms;
+  if (dt > 0.1f) dt = 0.1f;                            // ignore long stalls
 
-  // Randomly flip direction; the more you move, the faster it flips
-  if (ms >= nextDirChangeMs) {
-    motorDir = (random(0, 2) == 0) ? 1 : -1;
-    long minT = 400 - (long)(activity * 320);          // 400 ms (calm) -> 80 ms (hard motion)
-    nextDirChangeMs = ms + random(minT, minT * 3);
-  }
+  // Full forward+backward cycle: 1.5 s when calm -> 0.4 s with hard movement
+  float period = 1.5f - activity * 1.1f;
+  motorPhase += 2.0f * PI * dt / period;
+  if (motorPhase > 2.0f * PI) motorPhase -= 2.0f * PI;
 
-  // Smooth ramp toward the target brightness
+  // Strength follows how much you move (smoothed)
   float target = activity * 255.0f * motorScale;
   motorLevel += 0.25f * (target - motorLevel);
-  int duty = constrain((int)motorLevel, 0, 255);
 
-  if (motorDir > 0) setMotors(duty, 0);    // green LED = forward
-  else              setMotors(0, duty);    // red LED   = backward
+  float s = sinf(motorPhase);                          // +1 forward ... -1 backward
+  int duty = constrain((int)(fabsf(s) * motorLevel), 0, 255);
+
+  if (s >= 0) setMotors(duty, 0);                      // forward  (GPIO6 + green LED)
+  else        setMotors(0, duty);                      // backward (GPIO7 + red LED)
 }
 
 // ===================== BLUE LED =====================
@@ -275,7 +287,7 @@ bool mpuReadRaw(int16_t* r) {
 }
 
 void calibrateMPU() {
-  Serial.println("Calibrating... keep the band STILL and FLAT (Z up).");
+  Serial.printf("Calibrating at %lu ms... keep the band STILL and FLAT (Z up).\n", millis());
   setBlue(false);
   setMotors(0, 0);
   delay(1000);
@@ -457,6 +469,9 @@ void setup() {
   while (!Serial && millis() - t0 < 1500) delay(10);   // wait briefly for USB CDC
   Serial.println("\n=== ESP32-C3 Wristband ===");
 
+  esp_reset_reason_t rr = esp_reset_reason();
+  Serial.printf("Reset reason: %d (1=power-on, 4=panic, 5/6=watchdog, 15=BROWNOUT)\n", (int)rr);
+
   pinMode(PIN_B, OUTPUT);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
   setBlue(false);
@@ -465,8 +480,11 @@ void setup() {
   analogSetPinAttenuation(PIN_JOY_X, ADC_11db);
   analogSetPinAttenuation(PIN_JOY_Y, ADC_11db);
 
+  // Order matters on core 2.x (channels 0,1,2,3)
   pwmSetup(PIN_MOTOR1);
   pwmSetup(PIN_MOTOR2);
+  pwmSetup(PIN_DRV_IN1);
+  pwmSetup(PIN_DRV_IN2);
   setMotors(0, 0);
 
   randomSeed(esp_random());
@@ -486,6 +504,7 @@ void setup() {
   if (AUTO_CONNECT_ON_BOOT) connectToServer();
 
   lastSampleUs = micros();
+  lastMotorMs = millis();
 }
 
 // ===================== LOOP =====================
