@@ -1,20 +1,22 @@
 /*
-  ESP32 Wristband: MPU6500 -> ESP-NOW -> USB receiver ESP32 -> Python/Flask
-  -------------------------------------------------------------------------
-  MPU6500 : SDA = GPIO22, SCL = GPIO23 (I2C addr 0x68)
-  RGB LED : Blue = GPIO27 used (Red = GPIO25, Green = GPIO26 unused), common cathode
-  Button  : GPIO18 to GND (internal pull-up)
-  Motor LEDs: GPIO19 (green = forward), GPIO21 (red = backward), PWM
+  ESP32-C3 SuperMini Wristband: MPU6500 + Joystick -> ESP-NOW -> USB receiver ESP32 -> Python/Flask
+  --------------------------------------------------------------------------------------------------
+  MPU6500 : SDA = GPIO8, SCL = GPIO9 (I2C addr 0x68)
+  Blue LED: GPIO10 (through a resistor to GND)
+  Button  : GPIO2 to GND (internal pull-up)
+  Motor LEDs: GPIO3 (green = forward), GPIO4 (red = backward), PWM
+  Joystick: VRx = GPIO0, VRy = GPIO1 (VCC to 3V3, not 5V)
+
+  Arduino IDE: Board = ESP32C3 Dev Module, Tools > USB CDC On Boot > ENABLED
 
   Button:
     Short press = connect / disconnect
     Hold 3 sec  = re-calibrate sensor (keep band still and flat)
 
-  LED:
-    Flashing blue   = disconnected
-    Solid blue      = connected
-    Fast blue flash = calibrating / MPU error
-    (Battery check is DISABLED for now)
+  Blue LED:
+    Flashing   = not connected to receiver
+    Solid      = connected
+    Fast flash = calibrating / MPU error
 */
 
 #include <Arduino.h>
@@ -25,30 +27,24 @@
 #include <esp_idf_version.h>
 
 // ===================== USER SETTINGS =====================
-// >>> PASTE THE MAC PRINTED BY THE RECEIVER (RECEIVER_MAC,xx:xx:xx:xx:xx:xx) <<<
+// Receiver MAC a0:b7:65:0f:4d:1c
 uint8_t RECEIVER_MAC[6] = {0xA0, 0xB7, 0x65, 0x0F, 0x4D, 0x1C};
 const uint8_t ESPNOW_CHANNEL = 1;          // must match the receiver
 
 const bool AUTO_CONNECT_ON_BOOT = true;
 
-// ===================== PINS =====================
-#define PIN_SDA     22
-#define PIN_SCL     23
-#define PIN_R       25
-#define PIN_G       26
-#define PIN_B       27
-#define PIN_BUTTON  18
-#define PIN_MOTOR1  19   // green LED = forward
-#define PIN_MOTOR2  21   // red LED   = backward
-// #define PIN_BATT 34   // battery sensing disabled for now
+// ===================== PINS (ESP32-C3 SuperMini) =====================
+#define PIN_SDA     8
+#define PIN_SCL     9
+#define PIN_B       10   // blue LED
+#define PIN_BUTTON  2
+#define PIN_MOTOR1  3    // green LED = forward
+#define PIN_MOTOR2  4    // red LED   = backward
+#define PIN_JOY_X   0    // VRx (ADC1)
+#define PIN_JOY_Y   1    // VRy (ADC1)
 
-// Set to true if your RGB LED is common ANODE
-#define LED_COMMON_ANODE false
-
-// ===================== BATTERY (DISABLED) =====================
-// const float BATT_DIVIDER   = 2.0;
-// const float BATT_LOW_V     = 3.30;
-// const float BATT_RECOVER_V = 3.45;
+// Set to true if the LED is wired to 3.3V instead of GND (active low)
+#define LED_ACTIVE_LOW false
 
 // ===================== MPU6500 =====================
 #define MPU_ADDR        0x68
@@ -97,7 +93,7 @@ int sCount = 0;
 float accelActivity = 0, gyroActivity = 0;   // smoothed 0..1
 
 bool connectedToServer = false;
-float battVoltage = 0;         // sent as 0.00 while battery check is disabled
+float battVoltage = 0;         // sent as 0.00 (battery check removed)
 float motorScale = 1.0;
 
 int      motorDir = 1;         // 1 = forward (green), -1 = backward (red)
@@ -115,6 +111,13 @@ uint32_t lastSampleUs = 0, lastSendMs = 0, lastPrintMs = 0;
 bool btnLast = HIGH;
 uint32_t btnDownMs = 0;
 bool btnLongHandled = false;
+
+// joystick
+int joyXRaw = 0, joyYRaw = 0;          // 0..4095
+int joyXCenter = 2048, joyYCenter = 2048;
+int joyXPct = 0, joyYPct = 0;          // -100..+100
+const int JOY_DEADZONE_PCT = 5;
+uint32_t lastJoyMs = 0;
 
 // ===================== PWM HELPERS =====================
 void pwmSetup(int pin) {
@@ -164,25 +167,54 @@ void updateMotors() {
   motorLevel += 0.25f * (target - motorLevel);
   int duty = constrain((int)motorLevel, 0, 255);
 
-  if (motorDir > 0) setMotors(duty, 0);    // green LED (GPIO19) = forward
-  else              setMotors(0, duty);    // red LED   (GPIO21) = backward
+  if (motorDir > 0) setMotors(duty, 0);    // green LED = forward
+  else              setMotors(0, duty);    // red LED   = backward
 }
 
-// ===================== LED =====================
-void setRGB(bool r, bool g, bool b) {
-  if (LED_COMMON_ANODE) { r = !r; g = !g; b = !b; }
-  digitalWrite(PIN_R, r);
-  digitalWrite(PIN_G, g);
-  digitalWrite(PIN_B, b);
+// ===================== BLUE LED =====================
+void setBlue(bool on) {
+  digitalWrite(PIN_B, (on != LED_ACTIVE_LOW) ? HIGH : LOW);
 }
 
 void updateLED() {
   if (connectedToServer) {
-    setRGB(false, false, true);               // solid blue
+    setBlue(true);                            // solid
   } else {
-    bool on = (millis() / 500) % 2;           // flashing blue
-    setRGB(false, false, on);
+    setBlue((millis() / 500) % 2);            // flashing
   }
+}
+
+// ===================== JOYSTICK =====================
+int joyAvg(int pin, int n) {
+  long s = 0;
+  for (int i = 0; i < n; i++) { s += analogRead(pin); delay(2); }
+  return (int)(s / n);
+}
+
+void joyCalibrate() {
+  // Leave the stick untouched (centered) while this runs
+  joyXCenter = joyAvg(PIN_JOY_X, 50);
+  joyYCenter = joyAvg(PIN_JOY_Y, 50);
+  Serial.printf("Joystick center: X=%d Y=%d\n", joyXCenter, joyYCenter);
+}
+
+int joyToPct(int raw, int center) {
+  int pct;
+  if (raw >= center) pct = (raw - center) * 100 / max(1, 4095 - center);
+  else               pct = (raw - center) * 100 / max(1, center);
+  pct = constrain(pct, -100, 100);
+  if (abs(pct) < JOY_DEADZONE_PCT) pct = 0;
+  return pct;
+}
+
+void readJoystick() {
+  // average 4 reads to reduce ADC noise
+  long sx = 0, sy = 0;
+  for (int i = 0; i < 4; i++) { sx += analogRead(PIN_JOY_X); sy += analogRead(PIN_JOY_Y); }
+  joyXRaw = sx / 4;
+  joyYRaw = sy / 4;
+  joyXPct = joyToPct(joyXRaw, joyXCenter);
+  joyYPct = joyToPct(joyYRaw, joyYCenter);
 }
 
 // ===================== MPU6500 =====================
@@ -241,7 +273,7 @@ bool mpuReadRaw(int16_t* r) {
 
 void calibrateMPU() {
   Serial.println("Calibrating... keep the band STILL and FLAT (Z up).");
-  setRGB(false, false, false);
+  setBlue(false);
   setMotors(0, 0);
   delay(1000);
 
@@ -251,7 +283,7 @@ void calibrateMPU() {
   int good = 0;
 
   for (int i = 0; i < N; i++) {
-    if (i % 50 == 0) setRGB(false, false, (i / 50) % 2);   // fast blue flash while calibrating
+    if (i % 50 == 0) setBlue((i / 50) % 2);   // fast blue flash while calibrating
     if (mpuReadRaw(r)) {
       sax += r[0]; say += r[1]; saz += r[2];
       sgx += r[4]; sgy += r[5]; sgz += r[6];
@@ -278,22 +310,6 @@ void calibrateMPU() {
   Serial.printf("Accel offsets (g):   %.4f %.4f %.4f\n", axOff, ayOff, azOff);
   Serial.printf("Gyro offsets (dps):  %.4f %.4f %.4f\n", gxOff, gyOff, gzOff);
 }
-
-// ===================== BATTERY (DISABLED) =====================
-/*
-bool lowBattery = false;
-
-void updateBattery() {
-  uint32_t mv = 0;
-  for (int i = 0; i < 16; i++) mv += analogReadMilliVolts(PIN_BATT);
-  battVoltage = (mv / 16.0) / 1000.0 * BATT_DIVIDER;
-
-  if (battVoltage < 1.0) { lowBattery = false; return; }
-
-  if (!lowBattery && battVoltage < BATT_LOW_V) lowBattery = true;
-  else if (lowBattery && battVoltage > BATT_RECOVER_V) lowBattery = false;
-}
-*/
 
 // ===================== ESP-NOW =====================
 void handleSent(bool ok) {
@@ -326,6 +342,7 @@ void onRecv(const uint8_t*, const uint8_t* d, int len) { handleRecv(d, len); }
 bool espNowBegin() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);   // SuperMini boards often work better at reduced power
   esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
   if (esp_now_init() != ESP_OK) return false;
   esp_now_register_send_cb(onSent);
@@ -429,14 +446,17 @@ void handleButton() {
 // ===================== SETUP =====================
 void setup() {
   Serial.begin(115200);
-  delay(500);
-  Serial.println("\n=== ESP32 Wristband ===");
+  uint32_t t0 = millis();
+  while (!Serial && millis() - t0 < 1500) delay(10);   // wait briefly for USB CDC
+  Serial.println("\n=== ESP32-C3 Wristband ===");
 
-  pinMode(PIN_R, OUTPUT);
-  pinMode(PIN_G, OUTPUT);
   pinMode(PIN_B, OUTPUT);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
-  setRGB(false, false, false);
+  setBlue(false);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_JOY_X, ADC_11db);
+  analogSetPinAttenuation(PIN_JOY_Y, ADC_11db);
 
   pwmSetup(PIN_MOTOR1);
   pwmSetup(PIN_MOTOR2);
@@ -444,20 +464,16 @@ void setup() {
 
   randomSeed(esp_random());
 
-  // Battery ADC setup disabled
-  // analogReadResolution(12);
-  // analogSetPinAttenuation(PIN_BATT, ADC_11db);
-
   if (!mpuBegin()) {
-    Serial.println("MPU6500 not found! Check wiring (SDA=22, SCL=23).");
+    Serial.println("MPU6500 not found! Check wiring (SDA=GPIO8, SCL=GPIO9).");
     while (true) {                    // rapid blue flashing forever
-      setRGB(false, false, true);  delay(100);
-      setRGB(false, false, false); delay(100);
+      setBlue(true);  delay(100);
+      setBlue(false); delay(100);
     }
   }
 
   calibrateMPU();
-  // updateBattery();   // disabled
+  joyCalibrate();                     // keep the joystick centered during boot
 
   if (!espNowBegin()) Serial.println("ESP-NOW init failed");
   if (AUTO_CONNECT_ON_BOOT) connectToServer();
@@ -511,13 +527,17 @@ void loop() {
     sendData();
   }
 
-  // if (ms - lastBattMs >= 2000) { lastBattMs = ms; updateBattery(); }   // disabled
+  if (ms - lastJoyMs >= 20) {      // 50 Hz
+    lastJoyMs = ms;
+    readJoystick();
+  }
 
   if (ms - lastPrintMs >= PRINT_PERIOD_MS) {
     lastPrintMs = ms;
-    Serial.printf("A[g] %7.3f %7.3f %7.3f | G[dps] %8.2f %8.2f %8.2f | Act %.2f/%.2f | Batt: disabled | %s\n",
+    Serial.printf("A[g] %7.3f %7.3f %7.3f | G[dps] %8.2f %8.2f %8.2f | Act %.2f/%.2f | Joy X:%4d (%4d%%) Y:%4d (%4d%%) | %s\n",
                   ax, ay, az, gx, gy, gz,
                   accelActivity, gyroActivity,
+                  joyXRaw, joyXPct, joyYRaw, joyYPct,
                   connectedToServer ? "CONNECTED" : "DISCONNECTED");
   }
 
